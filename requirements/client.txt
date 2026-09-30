@@ -2,5 +2,6 @@ PyAudio
 ffmpeg-python
 scipy
 websocket-client
-rship_sdk
+rship_sdk>=0.1.0
 customtkinter
+Pillow
