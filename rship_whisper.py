@@ -307,25 +307,34 @@ def run_transcription(
         source: int, 
         stop_flag: threading.Event
 ):
+    last_sent = None
+    confirmed_sent = []
+
     def output_callback(data):
+        nonlocal last_sent, confirmed_sent
 
         last = data[-1]
         confirmed_sentences = data[:-1]
 
-        last_data = {
-            "message": last
-        }
-
-        confirmed_data = {
-            "messages": confirmed_sentences
-        }
-
-        print("Updating", last_data)
-        print("Rest", confirmed_data)
-
+        # The server resends its latest segments every time it processes more audio,
+        # changed or not. Pulse only on change so Bindings fire once per update.
         # EmitterProxy.pulse is a coroutine, and this callback runs on the WhisperLive thread.
-        rship_loop.send(currently_updating.pulse(last_data))
-        rship_loop.send(confirmed.pulse(confirmed_data))
+        if last != last_sent:
+            last_sent = last
+            last_data = {
+                "message": last
+            }
+            print("Updating", last_data)
+            rship_loop.send(currently_updating.pulse(last_data))
+
+        if confirmed_sentences != confirmed_sent:
+            confirmed_sent = confirmed_sentences
+            confirmed_data = {
+                "messages": confirmed_sentences
+            }
+            print("Rest", confirmed_data)
+            rship_loop.send(confirmed.pulse(confirmed_data))
+
         transcript_queue.put(' '.join(data))
 
     print("Starting Transcription Client")
