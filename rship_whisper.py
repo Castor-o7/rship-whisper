@@ -86,7 +86,15 @@ async def bootstrap_instance():
         print(f"Error during rship setup: {e}")
         return None, None
 
-async def start_speaker(instance: InstanceProxy, name: str, source_id: int, url: str, port: int, stop_flag: threading.Event):
+async def start_speaker(
+        instance: InstanceProxy,
+        name: str,
+        source_id: int,
+        url: str,
+        port: int,
+        stop_flag: threading.Event,
+        transcript_queue: Queue
+):
     speaker = await instance.add_target(TargetArgs(
         name=name,
         short_id=name.lower().replace(" ", "_"),
@@ -127,24 +135,24 @@ async def start_speaker(instance: InstanceProxy, name: str, source_id: int, url:
         )
     )
 
-    transcript_queue = Queue()
-
     run_transcription(currently_updating, confirmed, transcript_queue, url, port, source_id, stop_flag)
 
-    return transcript_queue
-
 def get_input_options():
+    """Returns the available audio inputs as a dict of display label -> PyAudio device index."""
     p = pyaudio.PyAudio()
 
     info = p.get_host_api_info_by_index(0)
     numdevices = info.get('deviceCount')
 
-    mic_options = []
+    mic_options = {}
 
     for i in range(0, numdevices):
-        if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-            name = p.get_device_info_by_host_api_device_index(0, i).get('name')
-            mic_options.append(name)
+        device = p.get_device_info_by_host_api_device_index(0, i)
+        if device.get('maxInputChannels') > 0:
+            # The index is part of the label so that devices sharing a name stay distinct.
+            mic_options[f"{device.get('index')}: {device.get('name')}"] = device.get('index')
+
+    p.terminate()
 
     return mic_options
 
@@ -159,47 +167,59 @@ def add_speaker( instance: InstanceProxy, config_frame: CTkFrame, transcript_fra
     name_entry.grid(column=1, row=row_offset, sticky="we", padx=(0, 1), pady=(0, 1))
 
     audio_label = CTkLabel(config_frame, font=font, text="Audio Source").grid(column=0, row=row_offset + 1, sticky="wn")
-    audio_selector = CTkComboBox(config_frame, values=get_input_options(), state="readonly", width=100)
+    input_options = get_input_options()
+    audio_selector = CTkComboBox(config_frame, values=list(input_options), state="readonly", width=100)
     audio_selector.grid(column=1, row=row_offset + 1, columnspan=2, sticky="we", pady=(0, 8))
 
     start_button = CTkButton(config_frame, font=font, text="Start Transcription")
     start_button.grid(column=2, row=row_offset, sticky="we", pady=(0, 1))
 
-    stop_event = threading.Event()
-    active = False
+    # One transcript box per speaker, reused across stop / start.
+    transcript_queue = Queue()
+    print_transcript(transcript_frame, transcript_queue, speaker_num, name_entry.get)
+
+    stop_event = None
 
     def on_button_click(e):
-        nonlocal active
-        if active:
+        nonlocal stop_event
+        if stop_event is not None:
             stop_event.set()
-            active = False
+            stop_event = None
             start_button.configure(text="Start Transcription")
         else:
-            stop_event.clear()
-            active = True
-            selected_index = audio_selector.get()
-            selected_source_id = get_input_options().index(selected_index)
-            transcript_queue = rship_loop.call(
-                start_speaker(instance, name_entry.get(), selected_source_id, get_url(), get_port(), stop_event)
+            selected_source = audio_selector.get()
+            if selected_source not in input_options:
+                print("Select an audio source before starting transcription")
+                return
+            # A new event per run: a run that is still winding down must not see it cleared.
+            stop_event = threading.Event()
+            rship_loop.call(
+                start_speaker(
+                    instance,
+                    name_entry.get(),
+                    input_options[selected_source],
+                    get_url(),
+                    get_port(),
+                    stop_event,
+                    transcript_queue
+                )
             )
             start_button.configure(text="Stop Transcription")
             print("Transcription started")
-            print_transcript(transcript_frame, transcript_queue)
 
     start_button.bind("<Button-1>", on_button_click)
 
-    return stop_event
-
-def print_transcript(frm: CTkFrame, transcript_queue: Queue):
+def print_transcript(frm: CTkFrame, transcript_queue: Queue, row: int, get_name: Callable[[], str]):
 
     transcript_content = CTkTextbox(frm, wrap="word")
-    transcript_content.grid(column=0, row=1, sticky="nsew")
+    transcript_content.grid(column=0, row=row, sticky="nsew")
     transcript_content.configure(state=DISABLED)  # Make the text widget read-only
+    frm.grid_rowconfigure(row, weight=1)
 
     def update_transcript():
         try:
             transcript = transcript_queue.get_nowait()
-            transcript_formatted = transcript.replace("\n", " ")
+            transcript_formatted = f"{get_name()}: " + transcript.replace("\n", " ")
             transcript_content.configure(state=NORMAL)
             transcript_content.delete(1.0, END)
             transcript_content.insert(END, transcript_formatted)
@@ -256,7 +276,6 @@ def run_gui_sync(client, instance):
     transcript_frame.grid(row=1, column=0, sticky="nsew")
 
     app.grid_rowconfigure(0, weight=100)
-    transcript_frame.grid_rowconfigure(0, weight=100)
     transcript_frame.grid_columnconfigure(0, weight=100)
 
     speaker_num = 0
