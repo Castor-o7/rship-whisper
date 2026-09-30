@@ -25,12 +25,48 @@ instance_name = "Whisper"
 service_type_code = "Whisper"
 color = "#4A006D"
 
+
+class RshipLoop:
+    """
+    Owns the asyncio event loop that the rship websocket lives on.
+
+    rship_sdk is async, but Tk and the WhisperLive client call in from ordinary threads,
+    so everything that talks to rship is handed to this one long-lived loop.
+    """
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+
+    def call(self, coro, timeout=10):
+        """Run a coroutine on the rship loop and wait for its result."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def send(self, coro):
+        """Schedule a coroutine on the rship loop without waiting for it."""
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        future.add_done_callback(self._report_failure)
+
+    @staticmethod
+    def _report_failure(future):
+        if not future.cancelled() and future.exception() is not None:
+            print(f"Error sending to rship: {future.exception()!r}")
+
+
+rship_loop: RshipLoop = None
+
+
 async def bootstrap_instance():
     print("Connecting to Rship at", rship_host, rship_port)
 
     try:
         client = rship.RshipExecClient(rship_host, rship_port)
         await client.connect()
+        if not client.is_connected:
+            return None, None
+
+        # Keep reading so the connection is serviced for as long as the app runs.
+        client.receive_task = asyncio.create_task(client.receive_messages())
 
         instance = await client.add_instance(
             InstanceArgs(
@@ -48,6 +84,7 @@ async def bootstrap_instance():
         return client, instance
     except Exception as e:
         print(f"Error during rship setup: {e}")
+        return None, None
 
 async def start_speaker(instance: InstanceProxy, name: str, source_id: int, url: str, port: int, stop_flag: threading.Event):
     speaker = await instance.add_target(TargetArgs(
@@ -130,8 +167,8 @@ def add_speaker( instance: InstanceProxy, config_frame: CTkFrame, transcript_fra
 
     stop_event = threading.Event()
     active = False
-    
-    async def on_start_clicked():
+
+    def on_button_click(e):
         nonlocal active
         if active:
             stop_event.set()
@@ -142,14 +179,12 @@ def add_speaker( instance: InstanceProxy, config_frame: CTkFrame, transcript_fra
             active = True
             selected_index = audio_selector.get()
             selected_source_id = get_input_options().index(selected_index)
-            transcript_queue = await start_speaker(instance, name_entry.get(), selected_source_id, get_url(), get_port(), stop_event)
+            transcript_queue = rship_loop.call(
+                start_speaker(instance, name_entry.get(), selected_source_id, get_url(), get_port(), stop_event)
+            )
             start_button.configure(text="Stop Transcription")
             print("Transcription started")
             print_transcript(transcript_frame, transcript_queue)
-
-    def on_button_click(e):
-        loop = asyncio.get_event_loop()
-        asyncio.run(on_start_clicked())
 
     start_button.bind("<Button-1>", on_button_click)
 
@@ -177,10 +212,9 @@ def print_transcript(frm: CTkFrame, transcript_queue: Queue):
     update_transcript()
 
 def run_gui():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    client, instance = loop.run_until_complete(bootstrap_instance())
-    loop.close()
+    global rship_loop
+    rship_loop = RshipLoop()
+    client, instance = rship_loop.call(bootstrap_instance())
 
     if client and instance:
         run_gui_sync(client, instance)
@@ -270,8 +304,9 @@ def run_transcription(
         print("Updating", last_data)
         print("Rest", confirmed_data)
 
-        currently_updating.pulse(last_data)
-        confirmed.pulse(confirmed_data)
+        # EmitterProxy.pulse is a coroutine, and this callback runs on the WhisperLive thread.
+        rship_loop.send(currently_updating.pulse(last_data))
+        rship_loop.send(confirmed.pulse(confirmed_data))
         transcript_queue.put(' '.join(data))
 
     print("Starting Transcription Client")
@@ -292,22 +327,12 @@ def run_transcription(
 
     print("Starting transcription")
 
-    transcript_thread = threading.Thread(target=client)
-    transcript_thread.setDaemon(True)
+    transcript_thread = threading.Thread(target=client, daemon=True)
     transcript_thread.start()
 
 
 def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    ui_thread = threading.Thread(target=run_gui, daemon=True)
-    ui_thread.start()
-
-    ui_thread.join()
-
-    print("gathering tasks")
-
+    run_gui()
 
 
 if __name__ == "__main__":
