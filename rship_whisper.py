@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import socket
 from typing import Callable
 from whisper_live.client import TranscriptionClient
 
@@ -15,10 +17,14 @@ from customtkinter import *
 from PIL import Image, ImageTk
 import os
 
-rship_host = "10.147.20.115"
-rship_port = "5155"
-machine_id = "Render001-Dev"
-machine_name = "Render001-Dev"
+# Defaults; override from the command line (see parse_args).
+rship_host = "localhost"
+rship_port = 5155
+machine_id = socket.gethostname()
+whisper_host = "localhost"
+whisper_port = 9090
+whisper_model = "small"
+whisper_lang = "en"
 service_id = "whisper"
 service_name = "Whisper"
 instance_name = "Whisper"
@@ -262,7 +268,7 @@ def run_gui_sync(client, instance):
     config_frame.grid(row=0, column=0, sticky="nswe")
 
     url_label = CTkLabel(config_frame, text="Whisper Server", font=font, fg_color="#4A006D", width=90).grid(column=0, row=0, sticky="wn", padx=(0, 5))
-    url_var = StringVar(value="localhost")
+    url_var = StringVar(value=whisper_host)
     server_url = CTkEntry(config_frame, textvariable=url_var)
     server_url.grid(column=1, row=0, sticky="we", padx=(0, 2), pady=(0, 5))
 
@@ -284,7 +290,7 @@ def run_gui_sync(client, instance):
         return server_url.get() 
     
     def get_port():
-        return 9090
+        return whisper_port
 
     def on_add_speaker(e):
         nonlocal speaker_num
@@ -342,9 +348,9 @@ def run_transcription(
     client = TranscriptionClient(
         url,
         port,
-        lang="en",
+        lang=whisper_lang,
         translate=False,
-        model="small",
+        model=whisper_model,
         use_vad=True,
         save_output_recording=False,                            # Only used for microphone input, False by Default
         output_recording_filename="./output_recording.wav",     # Only used for microphone input
@@ -359,7 +365,37 @@ def run_transcription(
     transcript_thread.start()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Whisper transcription as an rship executor.")
+    parser.add_argument("--rship-host", default=rship_host,
+                        help="rship server address (default: %(default)s)")
+    parser.add_argument("--rship-port", type=int, default=rship_port,
+                        help="rship server port (default: %(default)s)")
+    parser.add_argument("--machine-id", default=machine_id,
+                        help="machine this instance is reported under in rship (default: this hostname)")
+    parser.add_argument("--whisper-host", default=whisper_host,
+                        help="WhisperLive server address, editable in the window (default: %(default)s)")
+    parser.add_argument("--whisper-port", type=int, default=whisper_port,
+                        help="WhisperLive server port (default: %(default)s)")
+    parser.add_argument("--model", default=whisper_model,
+                        help="Whisper model size to request from the server (default: %(default)s)")
+    parser.add_argument("--lang", default=whisper_lang,
+                        help="language spoken, as a Whisper language code (default: %(default)s)")
+    return parser.parse_args()
+
+
 def main():
+    global rship_host, rship_port, machine_id, whisper_host, whisper_port, whisper_model, whisper_lang
+
+    args = parse_args()
+    rship_host = args.rship_host
+    rship_port = args.rship_port
+    machine_id = args.machine_id
+    whisper_host = args.whisper_host
+    whisper_port = args.whisper_port
+    whisper_model = args.model
+    whisper_lang = args.lang
+
     run_gui()
 
 
