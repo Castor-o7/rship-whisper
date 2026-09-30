@@ -278,8 +278,9 @@ class TranscriptionTeeClient:
     Attributes:
         clients (list): the underlying Client instances responsible for handling WebSocket connections.
     """
-    def __init__(self, clients, save_output_recording=False, output_recording_filename="./output_recording.wav", output_callback=None, input_device_index=None, stop_event: threading.Event = None):
+    def __init__(self, clients, save_output_recording=False, output_recording_filename="./output_recording.wav", output_callback=None, input_device_index=None, stop_event: threading.Event = None, audio_callback=None):
         self.output_callback = output_callback
+        self.audio_callback = audio_callback
         self.clients = clients
         if not self.clients:
             raise Exception("At least one client is required.")
@@ -554,6 +555,9 @@ class TranscriptionTeeClient:
 
                 self.multicast_packet(audio_array.tobytes())
 
+                if self.audio_callback is not None:
+                    self.audio_callback(audio_array)
+
                 # save frames if more than a minute
                 if len(self.frames) > 60 * self.rate:
                     if self.save_output_recording:
@@ -681,7 +685,8 @@ class TranscriptionClient(TranscriptionTeeClient):
         output_transcription_path="./output.srt",
         output_callback=None,
         input_device_index=None,
-        stop_event: threading.Event = None
+        stop_event: threading.Event = None,
+        audio_callback=None
     ):
         # self.output_callback = output_callback
         self.client = Client(host, port, lang, translate, model, srt_file_path=output_transcription_path, use_vad=use_vad, output_callback=output_callback)
@@ -695,6 +700,7 @@ class TranscriptionClient(TranscriptionTeeClient):
             save_output_recording=save_output_recording,
             output_recording_filename=output_recording_filename,
             input_device_index=input_device_index,
-            stop_event=stop_event
+            stop_event=stop_event,
+            audio_callback=audio_callback
         )
         

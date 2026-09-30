@@ -1,11 +1,13 @@
 import argparse
 import asyncio
 import socket
+import time
 from typing import Callable
 from whisper_live.client import TranscriptionClient
+import voice_analysis
 
 import rship_sdk as rship
-from rship_sdk import EmitterProxy, InstanceProxy, InstanceArgs, EmitterArgs, TargetArgs
+from rship_sdk import ActionArgs, EmitterProxy, InstanceProxy, InstanceArgs, EmitterArgs, TargetArgs, TargetProxy
 import threading
 from queue import Queue, Empty
 import pyaudio
@@ -25,6 +27,8 @@ whisper_host = "localhost"
 whisper_port = 9090
 whisper_model = "small"
 whisper_lang = "en"
+voice_analysis_enabled = False
+voice_gate_db = -45.0
 service_id = "whisper"
 service_name = "Whisper"
 instance_name = "Whisper"
@@ -53,6 +57,13 @@ class RshipLoop:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         future.add_done_callback(self._report_failure)
 
+    def send_later(self, delay, coro):
+        """Schedule a coroutine on the rship loop to start after `delay` seconds."""
+        self.loop.call_soon_threadsafe(self.loop.call_later, delay, self._start, coro)
+
+    def _start(self, coro):
+        self.loop.create_task(coro).add_done_callback(self._report_failure)
+
     @staticmethod
     def _report_failure(future):
         if not future.cancelled() and future.exception() is not None:
@@ -60,6 +71,11 @@ class RshipLoop:
 
 
 rship_loop: RshipLoop = None
+
+# Speaker target id -> the Analyser currently listening to it. Action handlers look the
+# analyser up here because rship_sdk keeps the first handler registered for an action,
+# while each run of a speaker gets a new Analyser.
+voice_analysers = {}
 
 
 async def bootstrap_instance():
@@ -141,7 +157,70 @@ async def start_speaker(
         )
     )
 
-    run_transcription(currently_updating, confirmed, transcript_queue, url, port, source_id, stop_flag)
+    audio_callback = await add_voice_analysis(speaker) if voice_analysis_enabled else None
+
+    run_transcription(currently_updating, confirmed, transcript_queue, url, port, source_id, stop_flag, audio_callback)
+
+async def add_voice_analysis(speaker: TargetProxy):
+    """
+    Publishes the voice analysis emitters and actions on a speaker.
+
+    Returns the callback to hand each chunk of recorded audio to.
+    """
+    target_id = speaker.id()
+    previous = voice_analysers.get(target_id)
+    # A gate set from rship should outlive stop / start.
+    analyser = voice_analysis.Analyser(gate_db=previous.gate_db if previous else voice_gate_db)
+    voice_analysers[target_id] = analyser
+
+    emitters = {}
+    for short_id, name in voice_analysis.EMITTERS.items():
+        emitters[short_id] = await speaker.add_emitter(
+            EmitterArgs(name=name, short_id=short_id, schema=voice_analysis.VALUE_SCHEMA)
+        )
+
+    async def set_gate(action, data):
+        current = voice_analysers[target_id]
+        current.gate_db = float(data.get("value", current.gate_db))
+        print(f"{speaker.args.name}: noise gate set to {current.gate_db} dB")
+
+    async def forget(action, data):
+        voice_analysers[target_id].forget()
+        print(f"{speaker.args.name}: repetition memory cleared")
+
+    await speaker.add_action(ActionArgs(name="Set noise gate (dB, e.g. -45)", short_id="setGate",
+                                        schema=voice_analysis.VALUE_SCHEMA, handler=set_gate))
+    await speaker.add_action(ActionArgs(name="Forget (clear repetition memory)", short_id="forget",
+                                        schema=voice_analysis.VALUE_SCHEMA, handler=forget))
+
+    async def send_pulses(pulses):
+        for short_id, payload in pulses:
+            await emitters[short_id].pulse(payload)
+
+    feed = voice_analysis.VoiceFeed(analyser)
+    playhead = 0.0
+    failed = False
+
+    def on_audio(chunk):
+        # Runs on the recording thread. A chunk arrives once its last sample is recorded, so its
+        # pulses are replayed at their original spacing, one chunk late, not sent as one burst.
+        nonlocal playhead, failed
+        if failed:
+            return
+        try:
+            now = time.monotonic()
+            # Follow on from the previous chunk so pulses never overtake each other, unless
+            # the schedule has fallen far behind the audio.
+            start = playhead if now < playhead < now + 1.0 else now
+            playhead = start + len(chunk) / voice_analysis.SR
+            for offset, pulses in feed.feed(chunk):
+                rship_loop.send_later(start + offset - now, send_pulses(pulses))
+        except Exception as e:
+            # Voice analysis is an extra: never let it take the transcription down with it.
+            failed = True
+            print(f"Voice analysis stopped for {speaker.args.name}: {e!r}")
+
+    return on_audio
 
 def get_input_options():
     """Returns the available audio inputs as a dict of display label -> PyAudio device index."""
@@ -311,7 +390,8 @@ def run_transcription(
         url: str, 
         port: int, 
         source: int, 
-        stop_flag: threading.Event
+        stop_flag: threading.Event,
+        audio_callback: Callable = None
 ):
     last_sent = None
     confirmed_sent = []
@@ -356,7 +436,8 @@ def run_transcription(
         output_recording_filename="./output_recording.wav",     # Only used for microphone input
         output_callback=output_callback,
         input_device_index=source,             
-        stop_event=stop_flag                                   # Only used for microphone input, 0 by Default
+        stop_event=stop_flag,                                  # Only used for microphone input, 0 by Default
+        audio_callback=audio_callback                          # Only used for microphone input
     )
 
     print("Starting transcription")
@@ -381,11 +462,17 @@ def parse_args():
                         help="Whisper model size to request from the server (default: %(default)s)")
     parser.add_argument("--lang", default=whisper_lang,
                         help="language spoken, as a Whisper language code (default: %(default)s)")
+    parser.add_argument("--voice-analysis", action="store_true",
+                        help="also publish how each speaker sounds: level, pitch, brightness, tempo, "
+                             "phrase and silence lengths, sustain and repetition")
+    parser.add_argument("--gate", type=float, default=voice_gate_db,
+                        help="voice analysis noise gate in dBFS; lower is more sensitive (default: %(default)s)")
     return parser.parse_args()
 
 
 def main():
     global rship_host, rship_port, machine_id, whisper_host, whisper_port, whisper_model, whisper_lang
+    global voice_analysis_enabled, voice_gate_db
 
     args = parse_args()
     rship_host = args.rship_host
@@ -395,6 +482,8 @@ def main():
     whisper_port = args.whisper_port
     whisper_model = args.model
     whisper_lang = args.lang
+    voice_analysis_enabled = args.voice_analysis
+    voice_gate_db = args.gate
 
     run_gui()
 
