@@ -30,6 +30,7 @@ python rship_whisper.py --rship-host 192.168.1.10
 | `--whisper-port` | `9090` | WhisperLive server port |
 | `--model` | `small` | Whisper model size requested from the server |
 | `--lang` | `en` | language spoken, as a Whisper language code |
+| `--cue` | none | a word or phrase every speaker listens for; repeat for more (see [Transcript events](#transcript-events)) |
 | `--voice-analysis` | off | also publish how each speaker sounds (see [Voice analysis](#voice-analysis)) |
 | `--gate` | `-45` | voice analysis noise gate in dBFS; lower is more sensitive |
 
@@ -43,6 +44,35 @@ Each speaker is a Target in the `whisper` service, with two Emitters:
 |---|---|---|
 | `Current` | `{ "message": string }` | the sentence being spoken; pulsed each time Whisper revises it |
 | `Confirmed` | `{ "messages": string[] }` | the (up to two) sentences before it; pulsed when a sentence is completed |
+
+## Transcript events
+
+`Current` and `Confirmed` carry text, which is awkward to bind to. Each speaker also has emitters
+a Binding can react to directly:
+
+| Emitter | Payload | Meaning |
+|---|---|---|
+| `sentence` *(event)* | `{ "message": string, "words": number }` | a segment of speech was finished. Whisper's segments are usually a sentence or a clause. |
+| `question` / `exclamation` *(event)* | `{ "message": string }` | the finished segment ended in `?` / `!` |
+| `wordCount` | `{ "value": number }` | words spoken since transcription was started |
+| `wordsPerMinute` | `{ "value": number }` | speaking rate over the last 15 seconds; falls to 0 in silence |
+| `cue` *(event)* | `{ "cue": string }` | any cue was spoken |
+| `cue_<words>` *(event)* | `{ "value": 1 }` | that cue was spoken, e.g. `cue_midnight`, `cue_open_the_door` |
+
+**Cues** are words or phrases to listen for: "when the narrator says *midnight*, start the scene".
+Give them at launch with `--cue midnight --cue "open the door"`, or set them for one speaker from
+rship with its `setCues` action, which takes `{ "cues": "midnight, open the door" }` and replaces
+that speaker's list. Matching ignores case and punctuation and is on whole words, so `night` does
+not match *midnight*.
+
+Whisper revises its text as it hears more. A cue fires once for each time it is spoken, when it
+first appears, and not again as the text around it is revised. Expect it roughly a second after
+the word, depending on the model and the machine running it: good for starting a scene, too loose
+for a hit that has to land on the word. A cue phrase that Whisper happens to split across two
+segments is missed.
+
+`sentence` fires when Whisper moves on to the next segment, or after two seconds without change
+if nothing follows, so the last thing said before a pause arrives about two seconds late.
 
 ## Voice analysis
 

@@ -4,6 +4,7 @@ import socket
 import time
 from typing import Callable
 from whisper_live.client import TranscriptionClient
+import transcript_events
 import voice_analysis
 
 import rship_sdk as rship
@@ -29,6 +30,7 @@ whisper_model = "small"
 whisper_lang = "en"
 voice_analysis_enabled = False
 voice_gate_db = -45.0
+default_cues = []
 service_id = "whisper"
 service_name = "Whisper"
 instance_name = "Whisper"
@@ -76,6 +78,13 @@ rship_loop: RshipLoop = None
 # analyser up here because rship_sdk keeps the first handler registered for an action,
 # while each run of a speaker gets a new Analyser.
 voice_analysers = {}
+
+# The same goes for transcript events. Per speaker target id: the TranscriptTracker of the
+# current run, the cues it listens for (so cues set from rship outlive stop / start), and its
+# emitters, which grow as cues are added.
+transcript_trackers = {}
+speaker_cues = {}
+transcript_emitters = {}
 
 
 async def bootstrap_instance():
@@ -158,8 +167,68 @@ async def start_speaker(
     )
 
     audio_callback = await add_voice_analysis(speaker) if voice_analysis_enabled else None
+    transcript_callback = await add_transcript_events(speaker, stop_flag)
 
-    run_transcription(currently_updating, confirmed, transcript_queue, url, port, source_id, stop_flag, audio_callback)
+    run_transcription(
+        currently_updating, confirmed, transcript_queue, url, port, source_id, stop_flag, audio_callback,
+        transcript_callback
+    )
+
+async def add_transcript_events(speaker: TargetProxy, stop_flag: threading.Event):
+    """
+    Publishes the transcript event emitters and the setCues action on a speaker.
+
+    Returns the callback to hand each transcript update to.
+    """
+    target_id = speaker.id()
+    tracker = transcript_events.TranscriptTracker()
+    transcript_trackers[target_id] = tracker
+
+    emitters = transcript_emitters.setdefault(target_id, {})
+    for short_id, (name, schema) in transcript_events.EMITTERS.items():
+        emitters[short_id] = await speaker.add_emitter(EmitterArgs(name=name, short_id=short_id, schema=schema))
+
+    async def use_cues(cues):
+        cues = transcript_trackers[target_id].set_cues(cues)
+        speaker_cues[target_id] = cues
+        # Each cue gets an emitter of its own, so a Binding can react to one cue without matching text.
+        for cue in cues:
+            short_id = transcript_events.cue_short_id(cue)
+            emitters[short_id] = await speaker.add_emitter(EmitterArgs(
+                name=f"Cue: {cue} (event)", short_id=short_id, schema=transcript_events.VALUE_SCHEMA
+            ))
+        print(f"{speaker.args.name}: listening for cues {cues}")
+
+    async def set_cues(action, data):
+        await use_cues(str(data.get("cues", "")).split(","))
+
+    await speaker.add_action(ActionArgs(
+        name="Set cue words (comma separated)", short_id="setCues",
+        schema={"type": "object", "properties": {"cues": {"type": "string"}}}, handler=set_cues
+    ))
+    await use_cues(speaker_cues.get(target_id, default_cues))
+
+    async def send_pulses(pulses):
+        for short_id, payload in pulses:
+            await emitters[short_id].pulse(payload)
+
+    async def tick():
+        # Some things happen when no transcript arrives: a sentence settles, the speaking rate falls.
+        while not stop_flag.is_set():
+            await asyncio.sleep(0.5)
+            pulses = tracker.tick(time.monotonic())
+            if pulses:
+                await send_pulses(pulses)
+
+    rship_loop.send(tick())
+
+    def on_transcript(segments):
+        # Runs on the WhisperLive thread.
+        pulses = tracker.update(segments, time.monotonic())
+        if pulses:
+            rship_loop.send(send_pulses(pulses))
+
+    return on_transcript
 
 async def add_voice_analysis(speaker: TargetProxy):
     """
@@ -391,7 +460,8 @@ def run_transcription(
         port: int, 
         source: int, 
         stop_flag: threading.Event,
-        audio_callback: Callable = None
+        audio_callback: Callable = None,
+        transcript_callback: Callable = None
 ):
     last_sent = None
     confirmed_sent = []
@@ -420,6 +490,9 @@ def run_transcription(
             }
             print("Rest", confirmed_data)
             rship_loop.send(confirmed.pulse(confirmed_data))
+
+        if transcript_callback is not None:
+            transcript_callback(data)
 
         transcript_queue.put(' '.join(data))
 
@@ -462,6 +535,9 @@ def parse_args():
                         help="Whisper model size to request from the server (default: %(default)s)")
     parser.add_argument("--lang", default=whisper_lang,
                         help="language spoken, as a Whisper language code (default: %(default)s)")
+    parser.add_argument("--cue", action="append", default=[], metavar="WORDS",
+                        help="a word or phrase every speaker listens for, firing an event when it is spoken; "
+                             "repeat for more (also settable per speaker from rship)")
     parser.add_argument("--voice-analysis", action="store_true",
                         help="also publish how each speaker sounds: level, pitch, brightness, tempo, "
                              "phrase and silence lengths, sustain and repetition")
@@ -472,7 +548,7 @@ def parse_args():
 
 def main():
     global rship_host, rship_port, machine_id, whisper_host, whisper_port, whisper_model, whisper_lang
-    global voice_analysis_enabled, voice_gate_db
+    global voice_analysis_enabled, voice_gate_db, default_cues
 
     args = parse_args()
     rship_host = args.rship_host
@@ -484,6 +560,7 @@ def main():
     whisper_lang = args.lang
     voice_analysis_enabled = args.voice_analysis
     voice_gate_db = args.gate
+    default_cues = args.cue
 
     run_gui()
 
